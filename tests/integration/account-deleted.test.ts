@@ -23,11 +23,18 @@ describe("AccountDeleted consumer", () => {
       `INSERT INTO care_link_invites (patient_id, caregiver_email, token_hash, status, expires_at) VALUES ($1,'c@x.com','h1','pending', now() + interval '7 days')`,
       [PATIENT_ID],
     );
-    const { handleAccountDeleted } = await import(
-      "@application/AccountDeletion/handleAccountDeleted.js"
-    );
+    const { handleAccountDeleted } =
+      await import("@application/AccountDeletion/handleAccountDeleted.js");
     const deps = { db: t.db, directory: t.directory, metrics: t.metrics };
+    // spy: AccountDeleted is the ONLY invalidation trigger (LD-CARE-06)
+    const invalidated: string[] = [];
+    const origInvalidate = t.directory.invalidate.bind(t.directory);
+    t.directory.invalidate = (userId: string) => {
+      invalidated.push(userId);
+      origInvalidate(userId);
+    };
     await handleAccountDeleted(deps, { userId: PATIENT_ID });
+    expect(invalidated).toEqual([PATIENT_ID]);
 
     const count = async (table: string) =>
       (
@@ -45,6 +52,13 @@ describe("AccountDeleted consumer", () => {
         )
       ).rows[0].c;
     expect(await endedEvents()).toBe(2);
+    // endedBy = deleted userId on every emitted CareLinkEnded
+    const payloads = await t.servicePg.query<{ payload: { endedBy: string } }>(
+      `SELECT payload FROM outbox WHERE event_type='CareLinkEnded'`,
+    );
+    for (const row of payloads.rows) {
+      expect(row.payload.endedBy).toBe(PATIENT_ID);
+    }
 
     // redelivery → zero new events (terminal guards)
     await handleAccountDeleted(deps, { userId: PATIENT_ID });
